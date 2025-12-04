@@ -1,0 +1,453 @@
+ // ============================================================================
+// GLASS FURNACE CONTROLLER - PSEUDOCODE
+// ============================================================================
+
+// STATE DEFINITIONS
+enum SystemState {
+    STARTUP,        // Initial checks and waiting for ready
+    AUTO,           // PI temperature control
+    LOW_FIRE,       // Foot pedal override (20% duty)
+    MANUAL,         // User manual control via knob
+    E_STOP,         // Emergency stop sequence
+    FAULT           // Safety fault (flame loss, sensor error)
+}
+
+// GLOBAL VARIABLES
+SystemState currentState = STARTUP
+SystemState previousState = STARTUP
+
+// Inputs
+float currentTemp = 0
+float targetTemp = 1200  // Default target, could be adjustable
+bool flameDetected = false
+bool eStopPressed = false
+bool footPedalPressed = false
+int manualKnobValue = 0
+int modeSelector = 0  // 0=AUTO, 1=MANUAL
+
+// Outputs
+bool gasValveOpen = false
+int blowerDutyCycle = 0  // 0-100%
+
+// Control parameters
+float Kp = 2.0              // Proportional gain
+float Ki = 0.1              // Integral gain
+float integralSum = 0       // Integral accumulator
+float integralMax = 50      // Anti-windup limit
+float lowFireDuty = 20      // Low fire percentage
+float eStopPurgeDuty = 10   // E-stop purge percentage
+unsigned long purgeStartTime = 0
+const unsigned long PURGE_DURATION = 30000  // 30 seconds
+
+// Timing
+unsigned long lastControlUpdate = 0
+const unsigned long CONTROL_INTERVAL = 100  // 100ms update rate
+
+
+// ============================================================================
+// MAIN SETUP
+// ============================================================================
+function setup() {
+    // Initialize pins
+    pinMode(GAS_VALVE_PIN, OUTPUT)
+    pinMode(BLOWER_PWM_PIN, OUTPUT)
+    pinMode(E_STOP_PIN, INPUT_PULLUP)      // NC button, LOW = pressed
+    pinMode(FOOT_PEDAL_PIN, INPUT_PULLUP)  // Momentary, LOW = pressed
+    pinMode(FLAME_EYE_PIN, INPUT)
+    pinMode(MODE_SELECT_PIN, INPUT)
+    
+    // Initialize to safe state
+    setGasValve(CLOSED)
+    setBlowerDuty(0)
+    
+    // Initialize thermocouple
+    initThermocouple()
+    
+    // Initialize serial for debugging
+    Serial.begin(115200)
+    
+    currentState = STARTUP
+}
+
+
+// ============================================================================
+// MAIN LOOP
+// ============================================================================
+function loop() {
+    // Read all inputs
+    readInputs()
+    
+    // CRITICAL SAFETY CHECKS - Run every loop, override everything
+    if (checkEmergencyStop()) {
+        return  // Safety function handles state change
+    }
+    
+    if (checkFlameFailure()) {
+        return  // Safety function handles state change
+    }
+    
+    // State machine
+    switch(currentState) {
+        case STARTUP:
+            handleStartup()
+            break
+            
+        case AUTO:
+            handleAutoMode()
+            break
+            
+        case LOW_FIRE:
+            handleLowFireMode()
+            break
+            
+        case MANUAL:
+            handleManualMode()
+            break
+            
+        case E_STOP:
+            handleEStopMode()
+            break
+            
+        case FAULT:
+            handleFaultMode()
+            break
+    }
+    
+    // Apply outputs (after state machine decides what to do)
+    updateOutputs()
+    
+    delay(10)  // Small delay for stability
+}
+
+
+// ============================================================================
+// INPUT READING
+// ============================================================================
+function readInputs() {
+    // Read temperature (with error checking)
+    currentTemp = readThermocouple()
+    if (currentTemp == ERROR_READING) {
+        // Handle sensor error
+        currentTemp = -999
+    }
+    
+    // Read digital inputs (with debouncing in real implementation)
+    eStopPressed = !digitalRead(E_STOP_PIN)  // NC button, inverted
+    footPedalPressed = !digitalRead(FOOT_PEDAL_PIN)
+    flameDetected = digitalRead(FLAME_EYE_PIN)
+    
+    // Read mode selector
+    modeSelector = digitalRead(MODE_SELECT_PIN)  // Could be multiple pins
+    
+    // Read manual control knob (0-1023 from ADC)
+    manualKnobValue = analogRead(MANUAL_KNOB_PIN)
+}
+
+
+// ============================================================================
+// CRITICAL SAFETY FUNCTIONS - HIGHEST PRIORITY
+// ============================================================================
+function checkEmergencyStop() {
+    if (eStopPressed) {
+        if (currentState != E_STOP) {
+            // Emergency stop initiated
+            Serial.println("E-STOP ACTIVATED!")
+            previousState = currentState
+            currentState = E_STOP
+            
+            // Immediate actions
+            setGasValve(CLOSED)
+            setBlowerDuty(eStopPurgeDuty)
+            purgeStartTime = millis()
+            
+            // Reset integral
+            integralSum = 0
+        }
+        return true
+    }
+    return false
+}
+
+function checkFlameFailure() {
+    // Only check flame if gas valve should be open
+    if (gasValveOpen && !flameDetected) {
+        if (currentState != FAULT && currentState != E_STOP) {
+            Serial.println("FAULT: Flame lost while gas valve open!")
+            previousState = currentState
+            currentState = FAULT
+            
+            // Immediate safe state
+            setGasValve(CLOSED)
+            setBlowerDuty(eStopPurgeDuty)  // Purge
+            purgeStartTime = millis()
+            
+            // Reset integral
+            integralSum = 0
+        }
+        return true
+    }
+    return false
+}
+
+function checkSensorError() {
+    if (currentTemp < -100 || currentTemp > 2000) {
+        // Thermocouple error or unreasonable reading
+        return true
+    }
+    return false
+}
+
+
+// ============================================================================
+// STATE HANDLERS
+// ============================================================================
+function handleStartup() {
+    // Startup sequence
+    // Wait for flame eye to be functional and user confirmation
+    
+    setGasValve(CLOSED)
+    setBlowerDuty(0)
+    
+    // Check if ready to transition
+    if (flameDetected) {
+        // Pilot flame is lit, ready to go
+        Serial.println("Pilot flame detected, ready for operation")
+        
+        // Check mode selector to determine next state
+        if (modeSelector == AUTO_MODE) {
+            currentState = AUTO
+            Serial.println("Entering AUTO mode")
+        } else {
+            currentState = MANUAL
+            Serial.println("Entering MANUAL mode")
+        }
+    } else {
+        // Flash LED or display "waiting for pilot"
+        // User must manually light pilot and establish flame
+    }
+}
+
+function handleAutoMode() {
+    // Check for mode transitions
+    if (footPedalPressed) {
+        currentState = LOW_FIRE
+        Serial.println("Foot pedal pressed - LOW_FIRE mode")
+        return
+    }
+    
+    if (modeSelector == MANUAL_MODE) {
+        currentState = MANUAL
+        integralSum = 0  // Reset integral when leaving AUTO
+        Serial.println("Mode switch to MANUAL")
+        return
+    }
+    
+    // Run PI control at specified interval
+    if (millis() - lastControlUpdate >= CONTROL_INTERVAL) {
+        lastControlUpdate = millis()
+        
+        float controlOutput = calculatePIControl()
+        
+        // Set outputs based on control
+        if (controlOutput > 5) {  // Minimum threshold to open gas
+            setGasValve(OPEN)
+            setBlowerDuty(controlOutput)
+        } else {
+            setGasValve(CLOSED)
+            setBlowerDuty(0)
+        }
+    }
+}
+
+function handleLowFireMode() {
+    // Fixed output mode while foot pedal held
+    setGasValve(OPEN)
+    setBlowerDuty(lowFireDuty)
+    
+    // Reset integral so it doesn't wind up during manual control
+    integralSum = 0
+    
+    // Check for release
+    if (!footPedalPressed) {
+        // Return to previous mode
+        if (modeSelector == AUTO_MODE) {
+            currentState = AUTO
+            Serial.println("Foot pedal released - returning to AUTO")
+        } else {
+            currentState = MANUAL
+            Serial.println("Foot pedal released - returning to MANUAL")
+        }
+    }
+}
+
+function handleManualMode() {
+    // User controls blower directly via knob
+    
+    // Check for mode transitions
+    if (footPedalPressed) {
+        currentState = LOW_FIRE
+        Serial.println("Foot pedal pressed - LOW_FIRE mode")
+        return
+    }
+    
+    if (modeSelector == AUTO_MODE) {
+        currentState = AUTO
+        Serial.println("Mode switch to AUTO")
+        return
+    }
+    
+    // Map knob (0-1023) to duty cycle (0-100%)
+    int desiredDuty = map(manualKnobValue, 0, 1023, 0, 100)
+    
+    // Set outputs
+    if (desiredDuty > 5) {
+        setGasValve(OPEN)
+        setBlowerDuty(desiredDuty)
+    } else {
+        setGasValve(CLOSED)
+        setBlowerDuty(0)
+    }
+}
+
+function handleEStopMode() {
+    // Purge sequence after e-stop
+    
+    setGasValve(CLOSED)  // Ensure closed
+    
+    unsigned long purgeTime = millis() - purgeStartTime
+    
+    if (purgeTime < PURGE_DURATION) {
+        // Still purging
+        setBlowerDuty(eStopPurgeDuty)
+    } else {
+        // Purge complete
+        setBlowerDuty(0)
+    }
+    
+    // Cannot exit E-STOP until button is released and user resets
+    if (!eStopPressed) {
+        // E-stop released, but stay in fault state
+        // Require manual reset (could be a separate button or power cycle)
+        Serial.println("E-STOP released. Power cycle or reset required.")
+        currentState = FAULT
+    }
+}
+
+function handleFaultMode() {
+    // Fault state - stay safe until manual intervention
+    
+    setGasValve(CLOSED)
+    
+    // Continue purge for safety
+    unsigned long purgeTime = millis() - purgeStartTime
+    if (purgeTime < PURGE_DURATION) {
+        setBlowerDuty(eStopPurgeDuty)
+    } else {
+        setBlowerDuty(0)
+    }
+    
+    // Require power cycle or manual reset to exit fault
+    // (In production, might have a reset button)
+}
+
+
+// ============================================================================
+// CONTROL ALGORITHMS
+// ============================================================================
+function calculatePIControl() {
+    // PI controller with anti-windup
+    
+    float error = targetTemp - currentTemp
+    
+    // Proportional term
+    float pTerm = Kp * error
+    
+    // Integral term with anti-windup
+    integralSum = integralSum + (error * (CONTROL_INTERVAL / 1000.0))
+    
+    // Clamp integral to prevent windup
+    if (integralSum > integralMax) {
+        integralSum = integralMax
+    } else if (integralSum < -integralMax) {
+        integralSum = -integralMax
+    }
+    
+    float iTerm = Ki * integralSum
+    
+    // Calculate output
+    float output = pTerm + iTerm
+    
+    // Constrain to valid range (0-100%)
+    if (output < 0) output = 0
+    if (output > 100) output = 100
+    
+    // Log for debugging
+    Serial.print("Temp: ")
+    Serial.print(currentTemp)
+    Serial.print(" Target: ")
+    Serial.print(targetTemp)
+    Serial.print(" Error: ")
+    Serial.print(error)
+    Serial.print(" Output: ")
+    Serial.println(output)
+    
+    return output
+}
+
+
+// ============================================================================
+// OUTPUT FUNCTIONS
+// ============================================================================
+function setGasValve(state) {
+    // NC valve: HIGH = open, LOW = closed (safe)
+    if (state == OPEN) {
+        digitalWrite(GAS_VALVE_PIN, HIGH)
+        gasValveOpen = true
+    } else {
+        digitalWrite(GAS_VALVE_PIN, LOW)
+        gasValveOpen = false
+    }
+}
+
+function setBlowerDuty(dutyCycle) {
+    // dutyCycle is 0-100%
+    // Map to PWM value (0-255 for Arduino)
+    int pwmValue = map(dutyCycle, 0, 100, 0, 255)
+    analogWrite(BLOWER_PWM_PIN, pwmValue)
+    blowerDutyCycle = dutyCycle
+}
+
+function updateOutputs() {
+    // Called after state machine
+    // Outputs are already set by state handlers
+    // This function could be used for additional safety checks
+    
+    // Final safety check before outputs
+    if (!flameDetected && gasValveOpen) {
+        // Should never happen due to safety checks, but just in case
+        setGasValve(CLOSED)
+    }
+}
+
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+function readThermocouple() {
+    // Read from MAX31855
+    // Returns temperature in Celsius
+    // Returns ERROR_READING if sensor fault
+    
+    temperature = MAX31855.readCelsius()
+    
+    if (isnan(temperature)) {
+        return ERROR_READING
+    }
+    
+    return temperature
+}
+
+function initThermocouple() {
+    // Initialize MAX31855 via SPI
+    // Setup communication
+}
